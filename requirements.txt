@@ -1,2 +1,5 @@
-paramiko
-dotenv
+paramiko==4.0.0
+dotenv == 0.9.9 
+fastapi[standard] == 0.128.8
+pydantic==2.12.5
+uvicorn==0.39.0
