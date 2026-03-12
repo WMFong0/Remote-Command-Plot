@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import threading
 import json
+import shlex
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -21,7 +22,6 @@ from logging.handlers import RotatingFileHandler
 
 # Load environment variables if present (optional)
 load_dotenv()
-
 
 # =============================================================================
 # Logging Setup
@@ -123,14 +123,15 @@ class CommandRequest(BaseModel):
 
 
 class CloseRequest(BaseModel):
-    id: Optional[str] = None  # optional; if omitted, closes all sessions
+    id: Optional[str] = None  # optional; if omitted, closes all sessions (unless force_inactive is true)
+    force_inactive: Optional[bool] = False  # when true, close only inactive sessions if id omitted or not found
 
 
 # =============================================================================
 # Session Store & Config
 # =============================================================================
 
-# session_id -> { client, channel, sudo_pw, created_at, last_seen, host, username }
+# session_id -> { client, channel, sudo_pw, created_at, last_seen, host, username, id }
 sessions: Dict[str, Dict[str, Any]] = {}
 
 # Protects the sessions dict for concurrent access
@@ -181,6 +182,18 @@ def _close_session_resources(s: Dict[str, Any]) -> None:
             logger.debug("SSH client closed", extra={"session_id": sid, "host": _mask_host(host), "username": username})
     except Exception as e:
         logger.warning("Error closing SSH client", extra={"error": str(e), "session_id": sid})
+
+def _is_client_active(client: Optional[paramiko.SSHClient]) -> bool:
+    if not client:
+        return False
+    try:
+        transport = client.get_transport()
+        return bool(transport and transport.is_active())
+    except Exception:
+        return False
+
+def _is_session_active(s: Dict[str, Any]) -> bool:
+    return _is_client_active(s.get("client"))
 
 def _expire_idle_sessions() -> int:
     """Close and remove sessions idle beyond SESSION_TTL_SECONDS. Returns count removed."""
@@ -252,9 +265,13 @@ def _read_all(channel: paramiko.Channel, quiet_timeout: float = 1.0, chunk_timeo
 
         time.sleep(0.05)
 
-    return b"".join(buf).decode(errors="replace")
+    out = b"".join(buf).decode(errors="replace")
+    return out
 
 def _send_and_collect(channel: paramiko.Channel, cmd: str, settle: float = 0.12, quiet_timeout: float = 1.0) -> str:
+    if getattr(channel, "closed", False):
+        logger.error("Attempted to send on a closed channel")
+        raise RuntimeError("SSH channel is closed by remote")
     logger.debug("Sending command", extra={"command": cmd})
     channel.send(cmd + "\n")
     time.sleep(settle)
@@ -296,6 +313,33 @@ def _get_client_ip(request: Request) -> str:
         return request.client.host
     return "unknown"
 
+def _await_shell_ready(channel: paramiko.Channel, timeout: float = 6.0) -> str:
+    """
+    Ensure the interactive shell is ready by sending a readiness marker and waiting for it.
+    Returns the accumulated output read during readiness wait.
+    """
+    # Flush any initial banner/motd
+    _ = _read_all(channel, quiet_timeout=0.3)
+    marker = "__RC_READY__"
+    try:
+        channel.send(f"echo {marker}\n")
+    except Exception as e:
+        logger.error("Failed to send readiness marker; channel likely closed", extra={"error": str(e)})
+        raise
+
+    end_by = time.time() + timeout
+    acc = ""
+    while time.time() < end_by:
+        chunk = _read_all(channel, quiet_timeout=0.5)
+        if chunk:
+            acc += chunk
+            if marker in chunk:
+                logger.debug("Interactive shell is ready")
+                return acc
+        time.sleep(0.05)
+    logger.error("Timed out waiting for interactive shell readiness")
+    raise RuntimeError("Interactive shell did not become ready in time")
+
 def run_sudo_when_prompted(channel: paramiko.Channel, user_cmd: str, sudo_pw: str) -> str:
     """
     Send sudo password ONLY when prompted.
@@ -333,7 +377,7 @@ def run_sudo_when_prompted(channel: paramiko.Channel, user_cmd: str, sudo_pw: st
 # =============================================================================
 
 @asynccontextmanager
-async def fastapi_lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):
     global _cleaner_task
     # Startup
     _cleaner_task = asyncio.create_task(_session_cleaner())
@@ -369,7 +413,7 @@ app = FastAPI(
     title="Remote Command Plot API",
     description="For AS Watson GIT Use only",
     version="1.0.0",
-    lifespan=fastapi_lifespan
+    lifespan=lifespan,
 )
 
 # Request ID middleware (kept; no client IP logging here per Option B)
@@ -380,6 +424,7 @@ async def add_request_id(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     return response
+
 
 # =============================================================================
 # Routes
@@ -394,16 +439,7 @@ async def redirect_to_docs():
 def health_check(request: Request):
     client_ip = _get_client_ip(request)
     with _sessions_lock:
-        def _is_active(s: Dict[str, Any]) -> bool:
-            client = s.get("client")
-            if not client:
-                return False
-            try:
-                transport = client.get_transport()
-                return bool(transport and transport.is_active())
-            except Exception:
-                return False
-        any_active = any(_is_active(s) for s in sessions.values())
+        any_active = any(_is_session_active(s) for s in sessions.values())
         count = len(sessions)
     payload = {
         "status": "ok",
@@ -413,6 +449,23 @@ def health_check(request: Request):
     }
     logger.debug("Health check", extra={**payload, "client_ip": client_ip})
     return payload
+
+@app.get("/sessions")
+def list_sessions():
+    """List current session ids with minimal safe metadata for debugging."""
+    with _sessions_lock:
+        items = []
+        for sid, s in sessions.items():
+            active = _is_session_active(s)
+            items.append({
+                "id": sid,
+                "username": s.get("username"),
+                "host": _mask_host(s.get("host", "")),
+                "active": active,
+                "last_seen": s.get("last_seen"),
+                "created_at": s.get("created_at"),
+            })
+    return {"count": len(items), "sessions": items}
 
 @app.post("/open")
 async def open_connection(data: OpenRequest, request: Request):
@@ -436,16 +489,31 @@ async def open_connection(data: OpenRequest, request: Request):
             timeout=20,
         )
         logger.info("SSH connection established", extra={"host": masked_host, "username": data.username, "client_ip": client_ip})
+
+        # Keepalive helps avoid early idle closures on some networks
+        try:
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
+        except Exception:
+            pass
+
         # Interactive shell (PTY) for sudo TTY behavior
         channel = client.invoke_shell(term="xterm")
-        time.sleep(0.2)
+        time.sleep(0.25)
 
-        # Optional: move to a directory, then enter login shell
-        initial = ""
+        # Wait for interactive shell readiness by echoing a marker
+        try:
+            initial = _await_shell_ready(channel, timeout=6.0)
+        except Exception as e:
+            logger.warning("Shell readiness check failed; continuing", extra={"error": str(e)})
+            initial = ""
+
+        # Optional: change to a directory (quote safely). Do NOT run another login shell.
         if data.home_dir:
+            safe_dir = shlex.quote(data.home_dir)
             logger.debug("Changing directory", extra={"dir": data.home_dir, "client_ip": client_ip})
-            initial += _send_and_collect(channel, f"cd {data.home_dir}", settle=0.1)
-        initial += _send_and_collect(channel, "bash -l", settle=0.1)
+            initial += _send_and_collect(channel, f"cd {safe_dir} || echo 'cd_failed:$PWD'", settle=0.12)
 
         # Create session
         session_id = str(uuid.uuid4())
@@ -519,24 +587,71 @@ async def post_input(data: CommandRequest, request: Request):
 @app.post("/close")
 async def close_connection(data: Optional[CloseRequest] = None, request: Request = None):
     """
-    Close a specific session if 'id' is provided; if omitted, closes all sessions.
+    Close a specific session if 'id' is provided; if omitted:
+      - if force_inactive=True, close only inactive sessions;
+      - else, close all sessions.
+    If id is provided but not found:
+      - if force_inactive=True, close all inactive sessions and return diagnostics;
+      - else, return not_found with diagnostics.
     """
     client_ip = _get_client_ip(request) if request else "unknown"
+    force_inactive = bool(data and data.force_inactive)
     try:
+        # Helper to close all inactive sessions and return their IDs
+        def _close_inactive_sessions() -> List[str]:
+            to_close_ids: List[str] = []
+            to_close_objs: List[Dict[str, Any]] = []
+            with _sessions_lock:
+                for sid, s in list(sessions.items()):
+                    if not _is_session_active(s):
+                        to_close_ids.append(sid)
+                        to_close_objs.append(sessions.pop(sid))
+            logger.info("Closing inactive sessions", extra={"count": len(to_close_ids), "client_ip": client_ip})
+            for s in to_close_objs:
+                _close_session_resources(s)
+            return to_close_ids
+
         if data and data.id:
-            sid = data.id
-            s = None
+            sid = data.id.strip()
             with _sessions_lock:
                 s = sessions.pop(sid, None)
             if not s:
-                logger.info("Close requested for non-existent session", extra={"session_id": sid, "client_ip": client_ip})
-                return {"status": "not_found", "id": sid}
+                # Diagnostics about known sessions
+                with _sessions_lock:
+                    diag = []
+                    for k, v in sessions.items():
+                        diag.append({
+                            "id": k,
+                            "host": _mask_host(v.get("host", "")),
+                            "username": v.get("username"),
+                            "active": _is_session_active(v),
+                        })
+                if force_inactive:
+                    closed_ids = _close_inactive_sessions()
+                    logger.info(
+                        "Close requested for non-existent session; closed inactive instead",
+                        extra={"requested_id": sid, "client_ip": client_ip, "closed_inactive": closed_ids}
+                    )
+                    return {
+                        "status": "not_found_closed_inactive",
+                        "id": sid,
+                        "closed_inactive_ids": closed_ids,
+                        "known_sessions": diag,
+                    }
+                else:
+                    logger.info("Close requested for non-existent session", extra={"requested_id": sid, "client_ip": client_ip, "known_sessions": diag})
+                    return {"status": "not_found", "id": sid, "known_sessions": diag}
 
             logger.info("Closing session", extra={"session_id": sid, "host": _mask_host(s.get("host", "")), "username": s.get("username"), "client_ip": client_ip})
             _close_session_resources(s)
             return {"status": "closed", "id": sid}
+
         else:
-            # Close all
+            # No id provided
+            if force_inactive:
+                closed_ids = _close_inactive_sessions()
+                return {"status": "closed_inactive", "closed_inactive_ids": closed_ids}
+            # Close all sessions
             to_close: List[Dict[str, Any]] = []
             with _sessions_lock:
                 for _, s in sessions.items():
@@ -548,9 +663,9 @@ async def close_connection(data: Optional[CloseRequest] = None, request: Request
                 _close_session_resources(s)
 
             return {"status": "closed_all"}
-    except Exception as e:
+    except Exception:
         logger.exception("Error while closing session(s)", extra={"client_ip": client_ip})
-        return {"status": "error", "message": f"Error while closing session(s): {str(e)}"}
+        return {"status": "error", "message": "Error while closing session(s)"}
 
 
 # =============================================================================
