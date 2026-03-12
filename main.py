@@ -438,11 +438,6 @@ async def open_connection(data: OpenRequest, request: Request):
         logger.info("SSH connection established", extra={"host": masked_host, "username": data.username, "client_ip": client_ip})
         # Interactive shell (PTY) for sudo TTY behavior
         channel = client.invoke_shell(term="xterm")
-        # invoke_shell already allocates a pty; keep try/except if the server behaves differently
-        try:
-            channel.get_pty()
-        except Exception:
-            pass
         time.sleep(0.2)
 
         # Optional: move to a directory, then enter login shell
