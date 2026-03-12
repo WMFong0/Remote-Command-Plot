@@ -22,23 +22,6 @@ from logging.handlers import RotatingFileHandler
 # Load environment variables if present (optional)
 load_dotenv()
 
-# Instantiate FastAPI AFTER lifespan is defined
-app = FastAPI(
-    title="Remote Command Plot API",
-    description="For AS Watson GIT Use only",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# Request ID middleware (kept; no client IP logging here per Option B)
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
 
 # =============================================================================
 # Logging Setup
@@ -350,7 +333,7 @@ def run_sudo_when_prompted(channel: paramiko.Channel, user_cmd: str, sudo_pw: st
 # =============================================================================
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def fastapi_lifespan(app: FastAPI):
     global _cleaner_task
     # Startup
     _cleaner_task = asyncio.create_task(_session_cleaner())
@@ -381,6 +364,22 @@ async def lifespan(app: FastAPI):
             _close_session_resources(s)
         logger.info("Application shutdown complete")
 
+# Instantiate FastAPI AFTER lifespan is defined
+app = FastAPI(
+    title="Remote Command Plot API",
+    description="For AS Watson GIT Use only",
+    version="1.0.0",
+    lifespan=fastapi_lifespan
+)
+
+# Request ID middleware (kept; no client IP logging here per Option B)
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 # =============================================================================
 # Routes
