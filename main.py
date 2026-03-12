@@ -5,15 +5,14 @@ import time
 import uuid
 import asyncio
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
+from contextlib import asynccontextmanager
 
 import paramiko
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-from typing import Optional
 
 # Load environment variables if present (optional)
 load_dotenv()
@@ -22,6 +21,7 @@ app = FastAPI(
     title="Remote Command Plot API",
     description="For AS Watson GIT Use only",
     version="1.0.0",
+    lifespan=lifespan
 )
 
 # =============================================================================
@@ -41,7 +41,7 @@ class CommandRequest(BaseModel):
 
 
 class CloseRequest(BaseModel):
-    id: Optional[str] = None# optional; if omitted, closes all sessions
+    id: Optional[str] = None # optional; if omitted, closes all sessions
 
 
 # =============================================================================
@@ -60,7 +60,7 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "300"))
 # Cleaner interval seconds
 CLEANER_INTERVAL_SECONDS = int(os.getenv("CLEANER_INTERVAL_SECONDS", "60"))
 
-_cleaner_task: Optional[asyncio.Task]
+_cleaner_task: Optional[asyncio.Task] = None
 
 
 # =============================================================================
@@ -94,54 +94,31 @@ def _close_session_resources(s: Dict[str, Any]) -> None:
 def _expire_idle_sessions() -> int:
     """Close and remove sessions idle beyond SESSION_TTL_SECONDS. Returns count removed."""
     cutoff = _now() - SESSION_TTL_SECONDS
-    removed = 0
-    to_remove = []
+    removed:int = 0
+    to_close: List[Dict[str, Any]] = []
     with _sessions_lock:
+        dead_ids: List[str] = []
         for sid, s in sessions.items():
             last_seen = s.get("last_seen", s.get("created_at", 0))
             if last_seen < cutoff:
-                to_remove.append(sid)
-
-        for sid in to_remove:
+                dead_ids.append(sid)
+        for sid in dead_ids:
             s = sessions.pop(sid, None)
             if s:
+                to_close.append(s)
                 removed += 1
-    # Close resources outside lock
-    for sid in to_remove:
-        s = s  # not used, just for clarity
-        # Fetching s again is unnecessary here; already popped & had reference before.
-        # We'll rely on OS to close on GC if missed, but we handle during pop above.
-        pass
+    for s in to_close:
+        _close_session_resources(s)
     return removed
 
 async def _session_cleaner():
     """Background task: periodically expire idle sessions."""
     while True:
         try:
-            expired = 0
-            # Gather items to close outside of the lock to avoid long holds
-            cutoff = _now() - SESSION_TTL_SECONDS
-            to_close: list[Dict[str, Any]] = []
-            with _sessions_lock:
-                dead_ids = []
-                for sid, s in sessions.items():
-                    last_seen = s.get("last_seen", s.get("created_at", 0))
-                    if last_seen < cutoff:
-                        dead_ids.append(sid)
-                for sid in dead_ids:
-                    s = sessions.pop(sid, None)
-                    if s:
-                        to_close.append(s)
-                        expired += 1
-
-            # Close resources without holding the lock
-            for s in to_close:
-                _close_session_resources(s)
-
+            _expire_idle_sessions()
         except Exception:
             # Never let the cleaner crash the app
             pass
-
         await asyncio.sleep(CLEANER_INTERVAL_SECONDS)
 
 def _read_all(channel: paramiko.Channel, quiet_timeout: float = 1.0, chunk_timeout: float = 0.2) -> str:
@@ -149,7 +126,7 @@ def _read_all(channel: paramiko.Channel, quiet_timeout: float = 1.0, chunk_timeo
     Read from the interactive channel until no new data arrives for ~quiet_timeout.
     """
     end_by = time.time() + quiet_timeout
-    buf: list[bytes] = []
+    buf: List[bytes] = []
     try:
         channel.settimeout(chunk_timeout)
     except Exception:
@@ -186,7 +163,7 @@ def _require_session(session_id: str) -> Dict[str, Any]:
         if not s:
             raise HTTPException(status_code=400, detail="Invalid or expired session id. Call /open first.")
         ch: paramiko.Channel = s["channel"]
-        if ch is None or ch.closed:
+        if ch is None or getattr(ch, "closed", True):
             raise HTTPException(status_code=400, detail="SSH channel is not open. Call /open first.")
         return s
 
@@ -218,34 +195,33 @@ def run_sudo_when_prompted(channel: paramiko.Channel, user_cmd: str, sudo_pw: st
 
 
 # =============================================================================
-# FastAPI Lifecycle
+# FastAPI Lifecycle (Lifespan API)
 # =============================================================================
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global _cleaner_task
+    # Startup
     _cleaner_task = asyncio.create_task(_session_cleaner())
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    # Cancel cleaner
-    global _cleaner_task
-    if _cleaner_task:
-        _cleaner_task.cancel()
-        try:
-            await _cleaner_task
-        except Exception:
-            pass
+    try:
+        yield
+    finally:
+        # Shutdown
+        if _cleaner_task:
+            _cleaner_task.cancel()
+            try:
+                await _cleaner_task
+            except Exception:
+                pass
         _cleaner_task = None
-
-    # Close all sessions
-    to_close: list[Dict[str, Any]] = []
-    with _sessions_lock:
-        for sid, s in sessions.items():
-            to_close.append(s)
-        sessions.clear()
-    for s in to_close:
-        _close_session_resources(s)
+        # Close all sessions
+        to_close: List[Dict[str, Any]] = []
+        with _sessions_lock:
+            for _, s in list(sessions.items()):
+                to_close.append(s)
+            sessions.clear()
+        for s in to_close:
+            _close_session_resources(s)
 
 
 # =============================================================================
@@ -260,13 +236,19 @@ async def redirect_to_docs():
 @app.get("/health")
 def health_check():
     with _sessions_lock:
-        any_active = any(
-            s.get("client") and s["client"].get_transport() and s["client"].get_transport().is_active()
-            for s in sessions.values()
-        )
+        def _is_active(s: Dict[str, Any]) -> bool:
+            client = s.get("client")
+            if not client:
+                return False
+            try:
+                transport = client.get_transport()
+                return bool(transport and transport.is_active())
+            except Exception:
+                return False
+        any_active = any(_is_active(s) for s in sessions.values())
         count = len(sessions)
     return {
-        "status": "healthy",
+        "status": "ok",
         "any_ssh_connected": any_active,
         "active_sessions": count,
         "session_ttl_seconds": SESSION_TTL_SECONDS,
@@ -276,7 +258,6 @@ def health_check():
 async def open_connection(data: OpenRequest):
     if not data.host or not data.username or not data.password:
         raise HTTPException(status_code=400, detail="host, username, and password are required.")
-
     client = None
     channel = None
     try:
@@ -288,17 +269,21 @@ async def open_connection(data: OpenRequest):
             password=data.password,
             allow_agent=False,
             look_for_keys=False,
-            timeout=10,
+            timeout=20,
         )
-
         # Interactive shell (PTY) for sudo TTY behavior
-        channel = client.invoke_shell()
+        channel = client.invoke_shell(term="xterm")
+        # invoke_shell already allocates a pty; keep try/except if the server behaves differently
+        try:
+            channel.get_pty()
+        except Exception:
+            pass
         time.sleep(0.2)
 
         # Optional: move to a directory, then enter login shell
         initial = ""
         if data.home_dir:
-            initial += _send_and_collect(channel, data.home_dir, settle=0.1)
+            initial += _send_and_collect(channel, f"cd {data.home_dir}", settle=0.1)
         initial += _send_and_collect(channel, "bash -l", settle=0.1)
 
         # Create session
@@ -362,9 +347,9 @@ async def post_input(data: CommandRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/close")
-async def close_connection(data: Optional[CloseRequest]):
+async def close_connection(data: Optional[CloseRequest] = None):
     """
-    Close a specific session if 'id' is provided;
+    Close a specific session if 'id' is provided; if omitted, closes all sessions.
     """
     try:
         if data and data.id:
@@ -379,9 +364,9 @@ async def close_connection(data: Optional[CloseRequest]):
             return {"status": "closed", "id": sid}
         else:
             # Close all
-            to_close: list[Dict[str, Any]] = []
+            to_close: List[Dict[str, Any]] = []
             with _sessions_lock:
-                for sid, s in sessions.items():
+                for _, s in sessions.items():
                     to_close.append(s)
                 sessions.clear()
 
