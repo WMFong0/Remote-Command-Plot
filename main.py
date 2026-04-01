@@ -1,5 +1,14 @@
 # main.py
 
+"""FastAPI service for remote SSH command execution through interactive sessions.
+
+Production-focused behaviors in this module include:
+- Structured logging with request IDs
+- Session lifecycle management with idle cleanup
+- Bounded command length checks
+- Explicit SSH error handling with stable API responses
+"""
+
 import time
 import uuid
 import asyncio
@@ -7,8 +16,10 @@ import threading
 import shlex
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
+from logging import Logger
 
 import paramiko
+from paramiko.ssh_exception import AuthenticationException, SSHException
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -33,13 +44,15 @@ load_dotenv()
 
 # Load settings & logger
 settings: Settings = load_settings()
-logger = setup_logging(settings)
+logger: Logger = setup_logging(settings)
 
 # =============================================================================
 # Models
 # =============================================================================
 
 class OpenRequest(BaseModel):
+    """Payload for creating a new SSH interactive session."""
+
     host: str
     username: str
     password: str
@@ -47,11 +60,15 @@ class OpenRequest(BaseModel):
 
 
 class CommandRequest(BaseModel):
+    """Payload for sending a command to an existing session."""
+
     id: str
     command: str
 
 
 class CloseRequest(BaseModel):
+    """Payload for closing one or more active sessions."""
+
     id: Optional[str] = None
     force_inactive: Optional[bool] = False
 
@@ -62,10 +79,11 @@ class CloseRequest(BaseModel):
 
 # session_id -> session dict
 sessions: Dict[str, Dict[str, Any]] = {}
-_sessions_lock = threading.Lock()
+_sessions_lock: threading.Lock = threading.Lock()
 
-SESSION_TTL_SECONDS = settings.SESSION_TTL_SECONDS
-CLEANER_INTERVAL_SECONDS = settings.CLEANER_INTERVAL_SECONDS
+SESSION_TTL_SECONDS: int = settings.SESSION_TTL_SECONDS
+CLEANER_INTERVAL_SECONDS: int = settings.CLEANER_INTERVAL_SECONDS
+COMMAND_MAX_LENGTH: int = settings.COMMAND_MAX_LENGTH
 
 _cleaner_task: Optional[asyncio.Task] = None
 
@@ -75,8 +93,9 @@ _cleaner_task: Optional[asyncio.Task] = None
 # =============================================================================
 
 def _touch_session(session_id: str) -> None:
+    """Update session last-seen timestamp for activity-based expiry."""
     with _sessions_lock:
-        s = sessions.get(session_id)
+        s: Optional[Dict[str, Any]] = sessions.get(session_id)
         if s:
             s["last_seen"] = now()
             logger.debug(
@@ -90,8 +109,9 @@ def _touch_session(session_id: str) -> None:
 
 
 def _require_session(session_id: str) -> Dict[str, Any]:
+    """Get a valid session or raise HTTP 400 for invalid/closed sessions."""
     with _sessions_lock:
-        s = sessions.get(session_id)
+        s: Optional[Dict[str, Any]] = sessions.get(session_id)
         if not s:
             logger.warning("Invalid session id", extra={"session_id": session_id})
             raise HTTPException(400, "Invalid or expired session id")
@@ -105,7 +125,8 @@ def _require_session(session_id: str) -> Dict[str, Any]:
 
 
 def _expire_idle_sessions() -> int:
-    cutoff = now() - SESSION_TTL_SECONDS
+    """Close and remove sessions idle beyond configured TTL."""
+    cutoff: float = now() - SESSION_TTL_SECONDS
     expired: List[Dict[str, Any]] = []
 
     with _sessions_lock:
@@ -128,6 +149,7 @@ def _expire_idle_sessions() -> int:
 
 
 async def _session_cleaner():
+    """Background task that periodically reaps inactive sessions."""
     logger.info(
         "Session cleaner started",
         extra={
@@ -150,6 +172,7 @@ async def _session_cleaner():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Manage startup/shutdown lifecycle for background cleaner and sessions."""
     global _cleaner_task
     _cleaner_task = asyncio.create_task(_session_cleaner())
     logger.info("Application startup complete")
@@ -178,17 +201,18 @@ async def lifespan(app: FastAPI):
 # App
 # =============================================================================
 
-app = FastAPI(
-    title="Remote Command Plot API",
-    description="For AS Watson GIT Use only",
-    version="1.0.0",
+app: FastAPI = FastAPI(
+    title=settings.APP_NAME,
+    description=settings.APP_DESCRIPTION,
+    version=settings.APP_VERSION,
     lifespan=lifespan,
 )
 
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    """Attach request correlation ID to state and response headers."""
+    request_id: str = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
@@ -201,17 +225,19 @@ async def request_id_middleware(request: Request, call_next):
 
 @app.get("/", include_in_schema=False)
 async def root():
+    """Redirect root path to API docs."""
     return RedirectResponse("/docs")
 
 
 @app.get("/health")
 def health(request: Request):
-    client_ip = get_client_ip(request)
+    """Health probe endpoint with summarized session activity."""
+    client_ip: str = get_client_ip(request)
     with _sessions_lock:
-        active = any(is_session_active(s) for s in sessions.values())
-        count = len(sessions)
+        active: bool = any(is_session_active(s) for s in sessions.values())
+        count: int = len(sessions)
 
-    payload = {
+    payload: Dict[str, Any] = {
         "status": "ok",
         "any_ssh_connected": active,
         "active_sessions": count,
@@ -223,6 +249,7 @@ def health(request: Request):
 
 @app.get("/sessions")
 def list_sessions():
+    """Return redacted metadata for all active sessions."""
     with _sessions_lock:
         return {
             "count": len(sessions),
@@ -241,7 +268,8 @@ def list_sessions():
 
 @app.post("/open")
 async def open_connection(data: OpenRequest, request: Request):
-    client_ip = get_client_ip(request)
+    """Open a new SSH connection and create an interactive shell session."""
+    client_ip: str = get_client_ip(request)
 
     logger.info(
         "Attempting SSH connection",
@@ -252,37 +280,56 @@ async def open_connection(data: OpenRequest, request: Request):
         },
     )
 
-    client = paramiko.SSHClient()
+    client: paramiko.SSHClient = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=data.host,
-        username=data.username,
-        password=data.password,
-        allow_agent=False,
-        look_for_keys=False,
-        timeout=20,
-    )
+
+    try:
+        client.connect(
+            hostname=data.host,
+            username=data.username,
+            password=data.password,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=settings.SSH_CONNECT_TIMEOUT,
+        )
+    except AuthenticationException as exc:
+        logger.warning(
+            "SSH authentication failed",
+            extra={"client_ip": client_ip, "username": data.username, "host": mask_host(data.host), "error": str(exc)},
+        )
+        raise HTTPException(status_code=401, detail="SSH authentication failed") from exc
+    except (SSHException, TimeoutError, OSError) as exc:
+        logger.error(
+            "SSH connection failed",
+            extra={"client_ip": client_ip, "username": data.username, "host": mask_host(data.host), "error": str(exc)},
+        )
+        raise HTTPException(status_code=502, detail="Unable to establish SSH connection") from exc
 
     # Keepalive
     try:
-        t = client.get_transport()
+        t: Optional[paramiko.Transport] = client.get_transport()
         if t:
-            t.set_keepalive(30)
+            t.set_keepalive(settings.SSH_KEEPALIVE_SECONDS)
     except Exception:
         pass
 
-    channel = client.invoke_shell(term="xterm")
+    try:
+        channel: paramiko.Channel = client.invoke_shell(term="xterm")
+    except Exception as exc:
+        client.close()
+        raise HTTPException(status_code=502, detail="Failed to open interactive SSH shell") from exc
+
     time.sleep(0.25)
 
-    initial = await_shell_ready(channel, logger=logger)
+    initial: str = await_shell_ready(channel, timeout=settings.SSH_READY_TIMEOUT, logger=logger)
 
     if data.home_dir:
-        safe_dir = shlex.quote(data.home_dir)
+        safe_dir: str = shlex.quote(data.home_dir)
         initial += send_and_collect(
             channel, f"cd {safe_dir} || echo 'cd_failed:$PWD'", logger=logger
         )
 
-    session_id = str(uuid.uuid4())
+    session_id: str = str(uuid.uuid4())
     with _sessions_lock:
         sessions[session_id] = {
             "id": session_id,
@@ -310,13 +357,16 @@ async def open_connection(data: OpenRequest, request: Request):
 
 @app.post("/input")
 async def post_input(data: CommandRequest, request: Request):
-    client_ip = get_client_ip(request)
-    s = _require_session(data.id)
+    """Execute a command in an existing interactive shell session."""
+    client_ip: str = get_client_ip(request)
+    s: Dict[str, Any] = _require_session(data.id)
     _touch_session(data.id)
 
-    cmd = data.command.strip()
+    cmd: str = data.command.strip()
     if not cmd:
         raise HTTPException(400, "Empty command")
+    if len(cmd) > COMMAND_MAX_LENGTH:
+        raise HTTPException(400, f"Command exceeds max length ({COMMAND_MAX_LENGTH})")
 
     logger.info(
         "Executing command",
@@ -328,7 +378,7 @@ async def post_input(data: CommandRequest, request: Request):
     )
 
     if cmd.startswith("sudo "):
-        out = run_sudo_when_prompted(
+        out: str = run_sudo_when_prompted(
             s["channel"], cmd, s["sudo_pw"], logger=logger
         )
     else:
@@ -340,11 +390,13 @@ async def post_input(data: CommandRequest, request: Request):
 
 @app.post("/close")
 async def close_connection(data: Optional[CloseRequest] = None, request: Request = None):
-    client_ip = get_client_ip(request) if request else "unknown"
-    force = bool(data and data.force_inactive)
+    """Close one, inactive, or all sessions depending on request payload."""
+    client_ip: str = get_client_ip(request) if request else "unknown"
+    force: bool = bool(data and data.force_inactive)
 
     def close_inactive() -> List[str]:
-        closed = []
+        """Close sessions that are no longer transport-active."""
+        closed: List[str] = []
         with _sessions_lock:
             for sid, s in list(sessions.items()):
                 if not is_session_active(s):
@@ -393,7 +445,7 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn (dev)")
     uvicorn.run("main:app",
-                host="0.0.0.0",
-                port=8000,
-                reload=True
+                host=settings.APP_HOST,
+                port=settings.APP_PORT,
+                reload=settings.APP_RELOAD
                 )

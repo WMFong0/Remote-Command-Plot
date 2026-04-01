@@ -1,0 +1,21 @@
+# VCS and editor metadata
+.git
+.gitignore
+.vscode
+
+# Local Python environments and build artifacts
+.venv
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache
+.mypy_cache
+
+# Local runtime artifacts
+logs
+*.log
+
+# OS files
+.DS_Store

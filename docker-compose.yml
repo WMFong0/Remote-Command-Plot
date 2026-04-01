@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  remote-command-plot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: remote-command-plot:latest
+    container_name: remote-command-plot
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_RELOAD: "0"
+      LOG_FILE: "logs/app.log"
+    volumes:
+      - app_logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  app_logs:

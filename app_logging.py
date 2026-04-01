@@ -1,5 +1,11 @@
 # app_logging.py
 
+"""Structured and human-friendly logging setup for the API service.
+
+The logger supports either JSON output (for aggregation systems) or text output
+with optional color in console mode. File logging always rotates.
+"""
+
 import os
 import json
 import logging
@@ -120,22 +126,22 @@ def setup_logging(settings: Settings) -> logging.Logger:
       - Avoid duplicate handlers on reload
       - Make LOG_FILE absolute relative to this file by default
     """
-    log_level = settings.LOG_LEVEL
-    cfg_log_file = settings.LOG_FILE
-    log_max_bytes = settings.LOG_MAX_BYTES
-    log_backup_count = settings.LOG_BACKUP_COUNT
-    log_json = settings.LOG_JSON
+    log_level: str = settings.LOG_LEVEL
+    cfg_log_file: str = settings.LOG_FILE
+    log_max_bytes: int = settings.LOG_MAX_BYTES
+    log_backup_count: int = settings.LOG_BACKUP_COUNT
+    log_json: bool = settings.LOG_JSON
 
     # Resolve to absolute path relative to this file when LOG_FILE is relative
     if os.path.isabs(cfg_log_file):
-        log_file = cfg_log_file
+        log_file: str = cfg_log_file
     else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir: str = os.path.dirname(os.path.abspath(__file__))
         log_file = os.path.join(base_dir, cfg_log_file)
 
     _ensure_dir(log_file)
 
-    logger = logging.getLogger("remote_command_plot")
+    logger: logging.Logger = logging.getLogger("remote_command_plot")
     logger.setLevel(log_level)
     logger.propagate = False
 
@@ -144,7 +150,8 @@ def setup_logging(settings: Settings) -> logging.Logger:
         logger.removeHandler(h)
 
     # ----- File handler -----
-    fh = RotatingFileHandler(
+    # Persist logs to disk with rotation to avoid unbounded file growth.
+    fh: RotatingFileHandler = RotatingFileHandler(
         log_file,
         maxBytes=log_max_bytes,
         backupCount=log_backup_count,
@@ -156,7 +163,7 @@ def setup_logging(settings: Settings) -> logging.Logger:
     logger.addHandler(fh)
 
     # ----- Console handler -----
-    ch = logging.StreamHandler()  # stderr by default
+    ch: logging.StreamHandler = logging.StreamHandler()  # stderr by default
     ch.setLevel(log_level)
     # Console: JSON if LOG_JSON=1; colorful if LOG_JSON=0
     ch.setFormatter(JsonFormatter() if log_json else ColorContextFormatter())

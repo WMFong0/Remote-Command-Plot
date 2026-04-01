@@ -1,11 +1,20 @@
 # helper.py
 
+"""Shared helper utilities for time, request metadata, and SSH channel I/O.
+
+This module intentionally isolates low-level SSH/session logic from route
+handlers to keep endpoint code concise and easier to reason about.
+"""
+
 import time
 from typing import Optional, List, Dict, Any
 from logging import Logger
 
 import paramiko
 from fastapi import Request
+
+
+SessionDict = Dict[str, Any]
 
 
 # -----------------------------------------------------------------------------
@@ -28,7 +37,7 @@ def mask_host(host: str) -> str:
     try:
         if not host:
             return host
-        parts = host.split(".")
+        parts: List[str] = host.split(".")
         if len(parts) == 4 and all(part.isdigit() for part in parts):
             return ".".join(p if len(p) <= 2 else (p[0] + "*" + p[-1]) for p in parts)
         return host[:2] + "***" + host[-2:] if len(host) > 6 else "***"
@@ -42,7 +51,7 @@ def get_client_ip(request: Request) -> str:
     Prefers 'X-Forwarded-For' then falls back to request.client.host.
     """
     try:
-        xff = request.headers.get("x-forwarded-for")
+        xff: Optional[str] = request.headers.get("x-forwarded-for")
         if xff:
             return xff.split(",")[0].strip()
         if request.client:
@@ -66,21 +75,21 @@ def is_client_active(client: Optional[paramiko.SSHClient]) -> bool:
         return False
 
 
-def is_session_active(s: Dict[str, Any]) -> bool:
+def is_session_active(s: SessionDict) -> bool:
     """Check if a session dict has an active SSH client transport."""
     return is_client_active(s.get("client"))
 
 
-def close_session_resources(s: Dict[str, Any], logger: Optional[Logger] = None) -> None:
+def close_session_resources(s: SessionDict, logger: Optional[Logger] = None) -> None:
     """
     Safely close the Paramiko channel and client in a session object.
     """
-    sid = s.get("id")
-    host = s.get("host")
-    username = s.get("username")
+    sid: Optional[str] = s.get("id")
+    host: Optional[str] = s.get("host")
+    username: Optional[str] = s.get("username")
 
     try:
-        ch = s.get("channel")
+        ch: Optional[paramiko.Channel] = s.get("channel")
         if ch:
             ch.close()
             if logger:
@@ -90,7 +99,7 @@ def close_session_resources(s: Dict[str, Any], logger: Optional[Logger] = None) 
             logger.warning("Error closing channel", extra={"error": str(e), "session_id": sid})
 
     try:
-        cl = s.get("client")
+        cl: Optional[paramiko.SSHClient] = s.get("client")
         if cl:
             cl.close()
             if logger:
@@ -109,7 +118,8 @@ def read_all(
     """
     Read from the interactive channel until no new data arrives for ~quiet_timeout.
     """
-    end_by = time.time() + quiet_timeout
+    
+    end_by: float = time.time() + quiet_timeout
     buf: List[bytes] = []
     try:
         channel.settimeout(chunk_timeout)
@@ -117,7 +127,7 @@ def read_all(
         pass
 
     while True:
-        got_data = False
+        got_data: bool = False
         try:
             while channel.recv_ready():
                 buf.append(channel.recv(65535))
@@ -156,7 +166,7 @@ def send_and_collect(
         logger.debug("Sending command", extra={"command": cmd})
     channel.send(cmd + "\n")
     time.sleep(settle)
-    out = read_all(channel, quiet_timeout=quiet_timeout, logger=logger)
+    out: str = read_all(channel, quiet_timeout=quiet_timeout, logger=logger)
     if logger:
         logger.debug("Command output collected", extra={"bytes": len(out)})
     return out
@@ -173,7 +183,7 @@ def await_shell_ready(
     """
     # Flush any initial banner/motd
     _ = read_all(channel, quiet_timeout=0.3, logger=logger)
-    marker = "__RC_READY__"
+    marker: str = "__RC_READY__"
     try:
         channel.send(f"echo {marker}\n")
     except Exception as e:
@@ -181,10 +191,11 @@ def await_shell_ready(
             logger.error("Failed to send readiness marker; channel likely closed", extra={"error": str(e)})
         raise
 
-    end_by = time.time() + timeout
-    acc = ""
+    end_by: float = time.time() + timeout
+    acc: str = ""
     while time.time() < end_by:
-        chunk = read_all(channel, quiet_timeout=0.5, logger=logger)
+        # Read in short windows so we can repeatedly check for readiness marker.
+        chunk: str = read_all(channel, quiet_timeout=0.5, logger=logger)
         if chunk:
             acc += chunk
             if marker in chunk:
@@ -211,8 +222,8 @@ def run_sudo_when_prompted(
     We still only send the password if the prompt appears.
     """
     assert user_cmd.startswith("sudo ")
-    marker = "[SUDO-PROMPT]"
-    cmd = f"sudo -S -p '{marker}:' {user_cmd[len('sudo '):]}"
+    marker: str = "[SUDO-PROMPT]"
+    cmd: str = f"sudo -S -p '{marker}:' {user_cmd[len('sudo '):]}"
 
     if logger:
         logger.info("Executing sudo command", extra={"sudo": True, "command": user_cmd[:200]})
@@ -220,7 +231,7 @@ def run_sudo_when_prompted(
     channel.send(cmd + "\n")
     time.sleep(0.15)
 
-    out = read_all(channel, quiet_timeout=1.0, logger=logger)
+    out: str = read_all(channel, quiet_timeout=1.0, logger=logger)
 
     if marker.lower() in out.lower():
         if logger:
