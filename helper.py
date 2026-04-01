@@ -21,7 +21,14 @@ SessionDict = Dict[str, Any]
 # Time helpers
 # -----------------------------------------------------------------------------
 def now() -> float:
-    """Return current epoch time (seconds)."""
+    """Return the current UNIX epoch timestamp.
+
+    Args:
+        None
+
+    Returns:
+        float: Current UTC epoch time in seconds.
+    """
     return time.time()
 
 
@@ -29,10 +36,13 @@ def now() -> float:
 # Network / privacy helpers
 # -----------------------------------------------------------------------------
 def mask_host(host: str) -> str:
-    """
-    Mask IP/host for privacy in logs.
-    - IPv4: '10.123.45.67' -> '10.1*3.4*5.6*7'
-    - Hostname: keep first/last 2 chars if long, else '***'
+    """Mask host or IP values before writing them to logs.
+
+    Args:
+        host (str): Raw hostname or IPv4 address.
+
+    Returns:
+        str: Redacted host string that preserves limited structure for debugging.
     """
     try:
         if not host:
@@ -46,9 +56,14 @@ def mask_host(host: str) -> str:
 
 
 def get_client_ip(request: Request) -> str:
-    """
-    Best-effort client IP extraction with proxy awareness.
-    Prefers 'X-Forwarded-For' then falls back to request.client.host.
+    """Extract the best-available client IP address from an HTTP request.
+
+    Args:
+        request (Request): Incoming FastAPI request object.
+
+    Returns:
+        str: First `X-Forwarded-For` hop when present, otherwise socket peer IP,
+            or `"unknown"` if unavailable.
     """
     try:
         xff: Optional[str] = request.headers.get("x-forwarded-for")
@@ -65,7 +80,14 @@ def get_client_ip(request: Request) -> str:
 # Paramiko / SSH session helpers
 # -----------------------------------------------------------------------------
 def is_client_active(client: Optional[paramiko.SSHClient]) -> bool:
-    """Check if the SSH client's transport is active."""
+    """Determine whether a Paramiko SSH client has an active transport.
+
+    Args:
+        client (Optional[paramiko.SSHClient]): SSH client instance.
+
+    Returns:
+        bool: `True` when transport exists and is active, otherwise `False`.
+    """
     if not client:
         return False
     try:
@@ -76,13 +98,27 @@ def is_client_active(client: Optional[paramiko.SSHClient]) -> bool:
 
 
 def is_session_active(s: SessionDict) -> bool:
-    """Check if a session dict has an active SSH client transport."""
+    """Check whether a session dictionary represents an active SSH session.
+
+    Args:
+        s (SessionDict): Session object containing at least a `client` key.
+
+    Returns:
+        bool: `True` when the underlying SSH client transport is active.
+    """
     return is_client_active(s.get("client"))
 
 
 def close_session_resources(s: SessionDict, logger: Optional[Logger] = None) -> None:
-    """
-    Safely close the Paramiko channel and client in a session object.
+    """Close all SSH resources in a session dictionary safely and idempotently.
+
+    Args:
+        s (SessionDict): Session dictionary containing Paramiko client/channel objects.
+        logger (Optional[Logger], optional): Logger used for operational events.
+            Defaults to None.
+
+    Returns:
+        None: This helper performs side effects only.
     """
     sid: Optional[str] = s.get("id")
     host: Optional[str] = s.get("host")
@@ -115,8 +151,19 @@ def read_all(
     chunk_timeout: float = 0.2,
     logger: Optional[Logger] = None,
 ) -> str:
-    """
-    Read from the interactive channel until no new data arrives for ~quiet_timeout.
+    """Read all currently available bytes from an interactive SSH channel.
+
+    Args:
+        channel (paramiko.Channel): Interactive shell channel to read from.
+        quiet_timeout (float, optional): Time window with no new data after which
+            reading stops. Defaults to 1.0.
+        chunk_timeout (float, optional): Socket-level timeout for each receive loop.
+            Defaults to 0.2.
+        logger (Optional[Logger], optional): Logger for debug/error events.
+            Defaults to None.
+
+    Returns:
+        str: Decoded channel output collected during the read window.
     """
     
     end_by: float = time.time() + quiet_timeout
@@ -129,6 +176,8 @@ def read_all(
     while True:
         got_data: bool = False
         try:
+            if getattr(channel, "closed", False):
+                break
             while channel.recv_ready():
                 buf.append(channel.recv(65535))
                 got_data = True
@@ -155,8 +204,20 @@ def send_and_collect(
     quiet_timeout: float = 1.0,
     logger: Optional[Logger] = None,
 ) -> str:
-    """
-    Send a command to the interactive shell and collect output after a short settle time.
+    """Send a shell command and collect resulting output from the channel.
+
+    Args:
+        channel (paramiko.Channel): Interactive shell channel for command execution.
+        cmd (str): Shell command to send.
+        settle (float, optional): Delay after send before reading output.
+            Defaults to 0.12.
+        quiet_timeout (float, optional): Read inactivity window before read completion.
+            Defaults to 1.0.
+        logger (Optional[Logger], optional): Logger for debug and error events.
+            Defaults to None.
+
+    Returns:
+        str: Collected command output from the remote shell.
     """
     if getattr(channel, "closed", False):
         if logger:
@@ -164,7 +225,12 @@ def send_and_collect(
         raise RuntimeError("SSH channel is closed by remote")
     if logger:
         logger.debug("Sending command", extra={"command": cmd})
-    channel.send(cmd + "\n")
+    try:
+        channel.send(cmd + "\n")
+    except Exception as e:
+        if logger:
+            logger.error("Failed to send command", extra={"error": str(e)})
+        raise RuntimeError("Failed to send command to SSH channel") from e
     time.sleep(settle)
     out: str = read_all(channel, quiet_timeout=quiet_timeout, logger=logger)
     if logger:
@@ -177,9 +243,17 @@ def await_shell_ready(
     timeout: float = 6.0,
     logger: Optional[Logger] = None,
 ) -> str:
-    """
-    Ensure the interactive shell is ready by sending a readiness marker and waiting for it.
-    Returns the accumulated output read during readiness wait.
+    """Wait for an interactive shell to become responsive.
+
+    Args:
+        channel (paramiko.Channel): Interactive shell channel.
+        timeout (float, optional): Maximum wait duration in seconds.
+            Defaults to 6.0.
+        logger (Optional[Logger], optional): Logger for readiness diagnostics.
+            Defaults to None.
+
+    Returns:
+        str: Accumulated output captured while waiting for readiness.
     """
     # Flush any initial banner/motd
     _ = read_all(channel, quiet_timeout=0.3, logger=logger)
@@ -215,13 +289,20 @@ def run_sudo_when_prompted(
     sudo_pw: str,
     logger: Optional[Logger] = None,
 ) -> str:
+    """Execute a sudo command and send password only after explicit prompt detection.
+
+    Args:
+        channel (paramiko.Channel): Interactive shell channel.
+        user_cmd (str): User-supplied command expected to begin with `sudo `.
+        sudo_pw (str): Password sent only if sudo prompt marker appears.
+        logger (Optional[Logger], optional): Logger for command lifecycle events.
+            Defaults to None.
+
+    Returns:
+        str: Combined sudo command output, including post-password output when used.
     """
-    Send sudo password ONLY when prompted.
-    To detect the prompt deterministically (and avoid locale issues), we rewrite
-    the command to include -S (read from stdin) and a custom prompt marker via -p.
-    We still only send the password if the prompt appears.
-    """
-    assert user_cmd.startswith("sudo ")
+    if not user_cmd.startswith("sudo "):
+        raise ValueError("run_sudo_when_prompted requires a command starting with 'sudo '")
     marker: str = "[SUDO-PROMPT]"
     cmd: str = f"sudo -S -p '{marker}:' {user_cmd[len('sudo '):]}"
 

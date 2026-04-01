@@ -17,7 +17,14 @@ from config import Settings
 
 
 def _ensure_dir(path: str) -> None:
-    """Ensure the parent directory for a file path exists."""
+    """Create the parent directory for a file path when needed.
+
+    Args:
+        path (str): Target file path whose parent directory must exist.
+
+    Returns:
+        None: This helper performs side effects only.
+    """
     try:
         dirname = os.path.dirname(path)
         if dirname:
@@ -36,6 +43,14 @@ class JsonFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a log record as a JSON string with safe extra-field merging.
+
+        Args:
+            record (logging.LogRecord): Incoming Python logging record.
+
+        Returns:
+            str: Serialized JSON payload representing the log event.
+        """
         obj: dict[str, Any] = {
             "ts": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
             "level": record.levelname,
@@ -73,6 +88,14 @@ class ColorContextFormatter(logging.Formatter):
     RESET = "\033[0m"
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format log records as human-friendly colored text with key context.
+
+        Args:
+            record (logging.LogRecord): Incoming Python logging record.
+
+        Returns:
+            str: Colorized plain-text representation of the log entry.
+        """
         color = self.COLORS.get(record.levelname, "")
         asctime = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
 
@@ -115,16 +138,13 @@ class PlainContextFormatter(ColorContextFormatter):
 
 
 def setup_logging(settings: Settings) -> logging.Logger:
-    """
-    Logger setup:
-      - File handler: rotating
-          * LOG_JSON=1 -> JSON (machine-friendly)
-          * LOG_JSON=0 -> Plain text (NO color) in app.log
-      - Console handler:
-          * LOG_JSON=1 -> JSON
-          * LOG_JSON=0 -> Colorful text
-      - Avoid duplicate handlers on reload
-      - Make LOG_FILE absolute relative to this file by default
+    """Configure structured application logging for file and console outputs.
+
+    Args:
+        settings (Settings): Application configuration values controlling log output.
+
+    Returns:
+        logging.Logger: Initialized application logger ready for dependency-wide use.
     """
     log_level: str = settings.LOG_LEVEL
     cfg_log_file: str = settings.LOG_FILE
@@ -142,7 +162,8 @@ def setup_logging(settings: Settings) -> logging.Logger:
     _ensure_dir(log_file)
 
     logger: logging.Logger = logging.getLogger("remote_command_plot")
-    logger.setLevel(log_level)
+    numeric_level: int = getattr(logging, str(log_level).upper(), logging.INFO)
+    logger.setLevel(numeric_level)
     logger.propagate = False
 
     # Clear existing handlers (important with uvicorn --reload)
@@ -157,21 +178,21 @@ def setup_logging(settings: Settings) -> logging.Logger:
         backupCount=log_backup_count,
         encoding="utf-8",
     )
-    fh.setLevel(log_level)
+    fh.setLevel(numeric_level)
     # File: JSON if LOG_JSON=1; plain text (no colors) if LOG_JSON=0
     fh.setFormatter(JsonFormatter() if log_json else PlainContextFormatter())
     logger.addHandler(fh)
 
     # ----- Console handler -----
     ch: logging.StreamHandler = logging.StreamHandler()  # stderr by default
-    ch.setLevel(log_level)
+    ch.setLevel(numeric_level)
     # Console: JSON if LOG_JSON=1; colorful if LOG_JSON=0
     ch.setFormatter(JsonFormatter() if log_json else ColorContextFormatter())
     logger.addHandler(ch)
 
     # Align uvicorn loggers to our level
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logging.getLogger(name).setLevel(log_level)
+        logging.getLogger(name).setLevel(numeric_level)
 
     # Print resolved configuration
     logger.info(

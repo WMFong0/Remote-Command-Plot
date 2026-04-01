@@ -93,7 +93,14 @@ _cleaner_task: Optional[asyncio.Task] = None
 # =============================================================================
 
 def _touch_session(session_id: str) -> None:
-    """Update session last-seen timestamp for activity-based expiry."""
+    """Refresh the activity timestamp for a tracked SSH session.
+
+    Args:
+        session_id (str): Session identifier to mark as recently active.
+
+    Returns:
+        None: The session dictionary is updated in-place when present.
+    """
     with _sessions_lock:
         s: Optional[Dict[str, Any]] = sessions.get(session_id)
         if s:
@@ -109,7 +116,14 @@ def _touch_session(session_id: str) -> None:
 
 
 def _require_session(session_id: str) -> Dict[str, Any]:
-    """Get a valid session or raise HTTP 400 for invalid/closed sessions."""
+    """Retrieve and validate a live session object by ID.
+
+    Args:
+        session_id (str): Session identifier supplied by the API caller.
+
+    Returns:
+        Dict[str, Any]: Valid session dictionary with an open SSH channel.
+    """
     with _sessions_lock:
         s: Optional[Dict[str, Any]] = sessions.get(session_id)
         if not s:
@@ -125,7 +139,14 @@ def _require_session(session_id: str) -> Dict[str, Any]:
 
 
 def _expire_idle_sessions() -> int:
-    """Close and remove sessions idle beyond configured TTL."""
+    """Expire and close sessions that exceed the configured inactivity TTL.
+
+    Args:
+        None
+
+    Returns:
+        int: Number of sessions expired during the current sweep.
+    """
     cutoff: float = now() - SESSION_TTL_SECONDS
     expired: List[Dict[str, Any]] = []
 
@@ -149,7 +170,14 @@ def _expire_idle_sessions() -> int:
 
 
 async def _session_cleaner():
-    """Background task that periodically reaps inactive sessions."""
+    """Run periodic background cleanup for stale SSH sessions.
+
+    Args:
+        None
+
+    Returns:
+        None: Runs until cancellation during application shutdown.
+    """
     logger.info(
         "Session cleaner started",
         extra={
@@ -172,7 +200,14 @@ async def _session_cleaner():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage startup/shutdown lifecycle for background cleaner and sessions."""
+    """Manage application startup and shutdown lifecycle resources.
+
+    Args:
+        app (FastAPI): FastAPI application instance.
+
+    Returns:
+        None: Yield-based lifespan context for FastAPI runtime hooks.
+    """
     global _cleaner_task
     _cleaner_task = asyncio.create_task(_session_cleaner())
     logger.info("Application startup complete")
@@ -211,7 +246,15 @@ app: FastAPI = FastAPI(
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
-    """Attach request correlation ID to state and response headers."""
+    """Attach request correlation IDs for end-to-end traceability.
+
+    Args:
+        request (Request): Incoming FastAPI request.
+        call_next (Callable): Next middleware/route handler in the chain.
+
+    Returns:
+        Response: Downstream response including `X-Request-ID` header.
+    """
     request_id: str = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request.state.request_id = request_id
     response = await call_next(request)
@@ -225,13 +268,27 @@ async def request_id_middleware(request: Request, call_next):
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Redirect root path to API docs."""
+    """Redirect service root to interactive API documentation.
+
+    Args:
+        None
+
+    Returns:
+        RedirectResponse: HTTP redirect response targeting `/docs`.
+    """
     return RedirectResponse("/docs")
 
 
 @app.get("/health")
 def health(request: Request):
-    """Health probe endpoint with summarized session activity."""
+    """Provide health probe metadata and current session summary.
+
+    Args:
+        request (Request): Incoming request used for client IP logging context.
+
+    Returns:
+        Dict[str, Any]: Service health payload for probes and dashboards.
+    """
     client_ip: str = get_client_ip(request)
     with _sessions_lock:
         active: bool = any(is_session_active(s) for s in sessions.values())
@@ -249,7 +306,14 @@ def health(request: Request):
 
 @app.get("/sessions")
 def list_sessions():
-    """Return redacted metadata for all active sessions."""
+    """List all tracked sessions with redacted host metadata.
+
+    Args:
+        None
+
+    Returns:
+        Dict[str, Any]: Session count and per-session public status details.
+    """
     with _sessions_lock:
         return {
             "count": len(sessions),
@@ -268,7 +332,15 @@ def list_sessions():
 
 @app.post("/open")
 async def open_connection(data: OpenRequest, request: Request):
-    """Open a new SSH connection and create an interactive shell session."""
+    """Create a new SSH client, interactive channel, and tracked session.
+
+    Args:
+        data (OpenRequest): Connection payload with host, username, and password.
+        request (Request): Incoming request used for access logging context.
+
+    Returns:
+        Dict[str, Any]: Connection status, session identifier, and initial shell output.
+    """
     client_ip: str = get_client_ip(request)
 
     logger.info(
@@ -357,7 +429,15 @@ async def open_connection(data: OpenRequest, request: Request):
 
 @app.post("/input")
 async def post_input(data: CommandRequest, request: Request):
-    """Execute a command in an existing interactive shell session."""
+    """Execute a command against an existing interactive SSH session.
+
+    Args:
+        data (CommandRequest): Session ID and command payload.
+        request (Request): Incoming request used for client metadata logging.
+
+    Returns:
+        Dict[str, Any]: Echoed command metadata and captured command output.
+    """
     client_ip: str = get_client_ip(request)
     s: Dict[str, Any] = _require_session(data.id)
     _touch_session(data.id)
@@ -389,13 +469,30 @@ async def post_input(data: CommandRequest, request: Request):
 
 
 @app.post("/close")
-async def close_connection(data: Optional[CloseRequest] = None, request: Request = None):
-    """Close one, inactive, or all sessions depending on request payload."""
+async def close_connection(data: Optional[CloseRequest] = None, request: Optional[Request] = None):
+    """Close specific, inactive, or all SSH sessions based on request intent.
+
+    Args:
+        data (Optional[CloseRequest], optional): Closure options including target ID
+            and inactive-only mode. Defaults to None.
+        request (Optional[Request], optional): Incoming request for logging context.
+            Defaults to None.
+
+    Returns:
+        Dict[str, Any]: Closure result payload indicating action and affected session IDs.
+    """
     client_ip: str = get_client_ip(request) if request else "unknown"
     force: bool = bool(data and data.force_inactive)
 
     def close_inactive() -> List[str]:
-        """Close sessions that are no longer transport-active."""
+        """Close and remove sessions whose transport is no longer active.
+
+        Args:
+            None
+
+        Returns:
+            List[str]: Session IDs closed during the inactive cleanup.
+        """
         closed: List[str] = []
         with _sessions_lock:
             for sid, s in list(sessions.items()):
