@@ -185,13 +185,19 @@ async def _session_cleaner():
             "interval_seconds": CLEANER_INTERVAL_SECONDS,
         },
     )
-    while True:
-        try:
-            removed = _expire_idle_sessions()
-            logger.debug("Cleaner sweep done", extra={"expired": removed})
-        except Exception:
-            logger.exception("Cleaner error")
-        await asyncio.sleep(CLEANER_INTERVAL_SECONDS)
+    try:
+        while True:
+            try:
+                removed = _expire_idle_sessions()
+                logger.debug("Cleaner sweep done", extra={"expired": removed})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Cleaner error")
+            await asyncio.sleep(CLEANER_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("Session cleaner stopped")
+        raise
 
 
 # =============================================================================
@@ -219,7 +225,7 @@ async def lifespan(app: FastAPI):
             _cleaner_task.cancel()
             try:
                 await _cleaner_task
-            except Exception:
+            except asyncio.CancelledError:
                 pass
 
         with _sessions_lock:
@@ -469,19 +475,18 @@ async def post_input(data: CommandRequest, request: Request):
 
 
 @app.post("/close")
-async def close_connection(data: Optional[CloseRequest] = None, request: Optional[Request] = None):
+async def close_connection(request: Request, data: Optional[CloseRequest] = None):
     """Close specific, inactive, or all SSH sessions based on request intent.
 
     Args:
         data (Optional[CloseRequest], optional): Closure options including target ID
             and inactive-only mode. Defaults to None.
-        request (Optional[Request], optional): Incoming request for logging context.
-            Defaults to None.
+        request (Request): Incoming request for logging context.
 
     Returns:
         Dict[str, Any]: Closure result payload indicating action and affected session IDs.
     """
-    client_ip: str = get_client_ip(request) if request else "unknown"
+    client_ip: str = get_client_ip(request)
     force: bool = bool(data and data.force_inactive)
 
     def close_inactive() -> List[str]:
