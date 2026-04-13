@@ -401,7 +401,7 @@ async def open_connection(data: OpenRequest, request: Request):
 
     initial: str = await_shell_ready(channel, timeout=settings.SSH_READY_TIMEOUT, logger=logger)
 
-    if data.home_dir:
+    if data.home_dir and data.home_dir != "string":
         safe_dir: str = shlex.quote(data.home_dir)
         initial += send_and_collect(
             channel, f"cd {safe_dir} || echo 'cd_failed:$PWD'", logger=logger

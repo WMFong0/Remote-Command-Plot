@@ -115,6 +115,8 @@ class ColorContextFormatter(logging.Formatter):
             context.append(f"sid={record.session_id}")
         if hasattr(record, "username"):
             context.append(f"user={record.username}")
+        if hasattr(record, "command"):
+            context.append(f"cmd={record.command}")
 
         if context:
             base += " | " + " ".join(context)
